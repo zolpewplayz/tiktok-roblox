@@ -183,17 +183,22 @@ app.get("/rosa-stream", requireSecret, (req, res) => {
 
   console.log("[OBS] obs-music-switcher connected to /rosa-stream ✅");
 
-  const onRosa = (data) => {
+const onRosa = (data) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
   events.on("rosa_gift", onRosa);
 
+  // Heartbeat every 20 seconds — stops Railway from killing the connection
+  const heartbeat = setInterval(() => {
+    res.write(`: heartbeat\n\n`);
+  }, 20_000);
+
   req.on("close", () => {
+    clearInterval(heartbeat);
     events.off("rosa_gift", onRosa);
     console.log("[OBS] obs-music-switcher disconnected from /rosa-stream");
   });
-});
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
