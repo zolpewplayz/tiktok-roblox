@@ -1,24 +1,34 @@
 /**
  * ============================================================
- *  TikTok → Roblox Live Bridge Server
+ *  TikTok → Roblox Live Bridge Server  —  v2 (Rosa OBS update)
  *  Stack: Node.js + Express + tiktok-live-connector
  * ============================================================
  *
- *  Install dependencies first:
- *    npm install tiktok-live-connector express cors dotenv
+ *  WHAT'S NEW vs original:
+ *    ✅ Emits a local "rosa_gift" event so obs-music-switcher.js
+ *       can auto-change your OBS music when Rosa is gifted
+ *    ✅ Everything else is identical to your working original
  *
- *  Environment variables (.env):
+ *  SETUP:
+ *    1. Replace your old server.js with this file on Railway
+ *    2. Run obs-music-switcher.js LOCALLY on your laptop (not Railway)
+ *       because it needs to talk to OBS which is on your computer
+ *
+ *  .env variables (same as before — nothing new required):
  *    TIKTOK_USERNAME=your_tiktok_username
  *    PORT=3000
- *    API_SECRET=your_secret_key_here   ← Roblox will send this header
+ *    API_SECRET=your_secret_key_here
  */
 
 require("dotenv").config();
-const express = require("express");
-const cors = require("cors");
+const express    = require("express");
+const cors       = require("cors");
+const { EventEmitter } = require("events");
 const { WebcastPushConnection } = require("tiktok-live-connector");
 
-const app = express();
+const app    = express();
+const events = new EventEmitter();   // ← internal event bus (Rosa trigger)
+
 app.use(cors());
 app.use(express.json());
 
@@ -26,58 +36,45 @@ app.use(express.json());
 const TIKTOK_USERNAME = process.env.TIKTOK_USERNAME || "YOUR_TIKTOK_USERNAME";
 const API_SECRET      = process.env.API_SECRET      || "CHANGE_THIS_SECRET";
 const PORT            = process.env.PORT            || 3000;
-
-// How long (ms) the server keeps an event in the queue before auto-expiring it
-const EVENT_TTL_MS = 60_000; // 60 seconds
+const EVENT_TTL_MS    = 60_000;
 
 // ─── In-Memory Event Queue ─────────────────────────────────────────────────────
-/**
- * Each item in the queue:
- * {
- *   id:          string   – unique event ID
- *   type:        "chat" | "follow" | "gift"
- *   tiktokUser:  string   – TikTok display name
- *   robloxUser:  string   – Roblox username parsed from comment (or same as tiktokUser)
- *   giftName:    string?  – only present for "gift" events
- *   giftCount:   number?  – repeat count for gifts
- *   timestamp:   number   – unix ms
- * }
- */
-let eventQueue = [];
+let eventQueue    = [];
 let eventIdCounter = 0;
 
 function nextId() {
   return `evt_${Date.now()}_${++eventIdCounter}`;
 }
 
-/** Remove events older than EVENT_TTL_MS */
 function pruneOldEvents() {
   const cutoff = Date.now() - EVENT_TTL_MS;
-  eventQueue = eventQueue.filter((e) => e.timestamp > cutoff);
+  eventQueue   = eventQueue.filter((e) => e.timestamp > cutoff);
 }
 
-/** Add an event, prune stale ones first */
 function enqueue(event) {
   pruneOldEvents();
   eventQueue.push({ ...event, id: nextId(), timestamp: Date.now() });
   console.log(`[QUEUE] +${event.type} | roblox:"${event.robloxUser}" | queue_size:${eventQueue.length}`);
+
+  // ── Rosa gift → fire internal event so obs-music-switcher.js reacts ──────
+  if (event.type === "gift" && event.giftName === "Rosa") {
+    console.log(`[OBS] 🌸 Rosa gift detected from @${event.tiktokUser} — firing music change event`);
+    events.emit("rosa_gift", {
+      tiktokUser: event.tiktokUser,
+      robloxUser: event.robloxUser,
+      giftCount:  event.giftCount || 1,
+    });
+  }
 }
 
 // ─── Roblox Username Extractor ─────────────────────────────────────────────────
-/**
- * Roblox usernames: 3–20 chars, letters/numbers/underscores, no leading/trailing underscore.
- * We look for the FIRST valid-looking username token in a comment.
- * Viewers are instructed to comment exactly their Roblox username.
- */
-const ROBLOX_USERNAME_REGEX = /^(?!.*__)[a-zA-Z0-9][a-zA-Z0-9_]{1,18}[a-zA-Z0-9]$|^[a-zA-Z0-9]{3,20}$/;
+const ROBLOX_USERNAME_REGEX =
+  /^(?!.*__)[a-zA-Z0-9][a-zA-Z0-9_]{1,18}[a-zA-Z0-9]$|^[a-zA-Z0-9]{3,20}$/;
 
 function extractRobloxUsername(comment) {
   if (!comment || typeof comment !== "string") return null;
-  // Try the whole trimmed comment first (most common case)
   const trimmed = comment.trim();
   if (ROBLOX_USERNAME_REGEX.test(trimmed)) return trimmed;
-
-  // Otherwise look for a word token that matches
   const tokens = trimmed.split(/\s+/);
   for (const token of tokens) {
     if (ROBLOX_USERNAME_REGEX.test(token)) return token;
@@ -90,49 +87,35 @@ let tiktokConnection = null;
 let connectionStatus = "disconnected";
 
 function connectToTikTok() {
-  if (tiktokConnection) {
-    tiktokConnection.disconnect();
-  }
+  if (tiktokConnection) tiktokConnection.disconnect();
 
   console.log(`[TIKTOK] Connecting to @${TIKTOK_USERNAME} ...`);
   tiktokConnection = new WebcastPushConnection(TIKTOK_USERNAME, {
-    processInitialData: false,   // skip backlog of old messages
-    enableExtendedGiftInfo: true // get full gift metadata
+    processInitialData:    false,
+    enableExtendedGiftInfo: true,
   });
 
-  // ── Chat Event ──────────────────────────────────────────────────────────────
   tiktokConnection.on("chat", (data) => {
-    const comment     = data.comment   || "";
-    const tiktokUser  = data.uniqueId  || data.nickname || "unknown";
-    const robloxUser  = extractRobloxUsername(comment);
-
-    if (!robloxUser) return; // comment doesn't look like a Roblox username
-
+    const comment    = data.comment  || "";
+    const tiktokUser = data.uniqueId || data.nickname || "unknown";
+    const robloxUser = extractRobloxUsername(comment);
+    if (!robloxUser) return;
     enqueue({ type: "chat", tiktokUser, robloxUser });
   });
 
-  // ── Follow Event ─────────────────────────────────────────────────────────────
   tiktokConnection.on("follow", (data) => {
     const tiktokUser = data.uniqueId || data.nickname || "unknown";
-    // Followers don't always comment a username simultaneously.
-    // We store the follow — if they ALSO comment a username, the Roblox side
-    // merges them via the "pendingFollowers" set (handled in Luau).
     enqueue({ type: "follow", tiktokUser, robloxUser: tiktokUser });
   });
 
-  // ── Gift Event ───────────────────────────────────────────────────────────────
   tiktokConnection.on("gift", (data) => {
-    // Only fire once per gift streak (when the streak ends)
     if (data.giftType === 1 && !data.repeatEnd) return;
-
-    const tiktokUser = data.uniqueId   || data.nickname   || "unknown";
-    const giftName   = data.giftName   || data.describe   || "Gift";
+    const tiktokUser = data.uniqueId    || data.nickname   || "unknown";
+    const giftName   = data.giftName    || data.describe   || "Gift";
     const giftCount  = data.repeatCount || 1;
-
     enqueue({ type: "gift", tiktokUser, robloxUser: tiktokUser, giftName, giftCount });
   });
 
-  // ── Connection lifecycle ──────────────────────────────────────────────────────
   tiktokConnection.connect()
     .then((state) => {
       connectionStatus = "connected";
@@ -156,53 +139,32 @@ function connectToTikTok() {
   });
 }
 
-// ─── Middleware: Validate Roblox requests ──────────────────────────────────────
+// ─── Middleware ────────────────────────────────────────────────────────────────
 function requireSecret(req, res, next) {
-  const secret = req.headers["x-api-secret"];
-  if (secret !== API_SECRET) {
+  if (req.headers["x-api-secret"] !== API_SECRET) {
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
 }
 
-// ─── REST API Endpoints ────────────────────────────────────────────────────────
-
-/**
- * GET /events
- * Roblox polls this every few seconds to fetch pending events.
- * Returns up to `limit` events (default 10) and removes them from the queue
- * so they aren't processed twice.
- *
- * Query params:
- *   ?limit=10   – max events to return per poll
- */
+// ─── REST API ─────────────────────────────────────────────────────────────────
 app.get("/events", requireSecret, (req, res) => {
   pruneOldEvents();
-  const limit  = Math.min(parseInt(req.query.limit) || 10, 50);
-  const batch  = eventQueue.splice(0, limit); // dequeue atomically
+  const limit = Math.min(parseInt(req.query.limit) || 10, 50);
+  const batch = eventQueue.splice(0, limit);
   res.json({ events: batch, remaining: eventQueue.length });
 });
 
-/**
- * GET /status
- * Health-check — lets you confirm the server is running and TikTok is connected.
- */
 app.get("/status", (req, res) => {
   res.json({
-    status:       "ok",
-    tiktok:       connectionStatus,
-    queueSize:    eventQueue.length,
-    uptime:       Math.floor(process.uptime()),
-    tiktokUser:   TIKTOK_USERNAME,
+    status:     "ok",
+    tiktok:     connectionStatus,
+    queueSize:  eventQueue.length,
+    uptime:     Math.floor(process.uptime()),
+    tiktokUser: TIKTOK_USERNAME,
   });
 });
 
-/**
- * POST /test-event  (development only — remove or protect in production)
- * Manually inject a test event so you can test Roblox without a live TikTok stream.
- *
- * Body: { "type": "chat"|"follow"|"gift", "robloxUser": "Builderman", "giftName": "Rose" }
- */
 app.post("/test-event", requireSecret, (req, res) => {
   const { type = "chat", robloxUser = "Builderman", giftName = "TestGift", giftCount = 1 } = req.body;
   const tiktokUser = req.body.tiktokUser || robloxUser;
@@ -210,10 +172,37 @@ app.post("/test-event", requireSecret, (req, res) => {
   res.json({ ok: true, queueSize: eventQueue.length });
 });
 
-// ─── Start ─────────────────────────────────────────────────────────────────────
+// ─── Rosa SSE endpoint (obs-music-switcher.js connects here) ──────────────────
+// SSE = Server-Sent Events. The switcher keeps this connection open and
+// receives a message the moment Rosa is gifted.
+app.get("/rosa-stream", requireSecret, (req, res) => {
+  res.setHeader("Content-Type",  "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection",    "keep-alive");
+  res.flushHeaders();
+
+  console.log("[OBS] obs-music-switcher connected to /rosa-stream ✅");
+
+  const onRosa = (data) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  events.on("rosa_gift", onRosa);
+
+  req.on("close", () => {
+    events.off("rosa_gift", onRosa);
+    console.log("[OBS] obs-music-switcher disconnected from /rosa-stream");
+  });
+});
+
+// ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀  Bridge server listening on http://localhost:${PORT}`);
   console.log(`🔑  API Secret: ${API_SECRET}`);
-  console.log(`🎮  Poll endpoint: GET /events  (used by Roblox)\n`);
+  console.log(`🎮  Poll endpoint: GET /events  (used by Roblox)`);
+  console.log(`🌸  Rosa SSE:      GET /rosa-stream  (used by obs-music-switcher.js)\n`);
   connectToTikTok();
 });
+
+// Export event emitter so obs-music-switcher can import it when running locally
+module.exports = { events };
