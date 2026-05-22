@@ -1,25 +1,3 @@
-/**
- * ============================================================
- *  TikTok → Roblox Live Bridge Server  —  v2 (Rosa OBS update)
- *  Stack: Node.js + Express + tiktok-live-connector
- * ============================================================
- *
- *  WHAT'S NEW vs original:
- *    ✅ Emits a local "rosa_gift" event so obs-music-switcher.js
- *       can auto-change your OBS music when Rosa is gifted
- *    ✅ Everything else is identical to your working original
- *
- *  SETUP:
- *    1. Replace your old server.js with this file on Railway
- *    2. Run obs-music-switcher.js LOCALLY on your laptop (not Railway)
- *       because it needs to talk to OBS which is on your computer
- *
- *  .env variables (same as before — nothing new required):
- *    TIKTOK_USERNAME=your_tiktok_username
- *    PORT=3000
- *    API_SECRET=your_secret_key_here
- */
-
 require("dotenv").config();
 const express    = require("express");
 const cors       = require("cors");
@@ -27,19 +5,17 @@ const { EventEmitter } = require("events");
 const { WebcastPushConnection } = require("tiktok-live-connector");
 
 const app    = express();
-const events = new EventEmitter();   // ← internal event bus (Rosa trigger)
+const events = new EventEmitter();
 
 app.use(cors());
 app.use(express.json());
 
-// ─── Configuration ────────────────────────────────────────────────────────────
 const TIKTOK_USERNAME = process.env.TIKTOK_USERNAME || "YOUR_TIKTOK_USERNAME";
 const API_SECRET      = process.env.API_SECRET      || "CHANGE_THIS_SECRET";
 const PORT            = process.env.PORT            || 3000;
 const EVENT_TTL_MS    = 60_000;
 
-// ─── In-Memory Event Queue ─────────────────────────────────────────────────────
-let eventQueue    = [];
+let eventQueue     = [];
 let eventIdCounter = 0;
 
 function nextId() {
@@ -56,9 +32,8 @@ function enqueue(event) {
   eventQueue.push({ ...event, id: nextId(), timestamp: Date.now() });
   console.log(`[QUEUE] +${event.type} | roblox:"${event.robloxUser}" | queue_size:${eventQueue.length}`);
 
-  // ── Rosa gift → fire internal event so obs-music-switcher.js reacts ──────
   if (event.type === "gift" && event.giftName === "Rosa") {
-    console.log(`[OBS] 🌸 Rosa gift detected from @${event.tiktokUser} — firing music change event`);
+    console.log(`[OBS] Rosa gift from @${event.tiktokUser} — firing music change`);
     events.emit("rosa_gift", {
       tiktokUser: event.tiktokUser,
       robloxUser: event.robloxUser,
@@ -67,7 +42,6 @@ function enqueue(event) {
   }
 }
 
-// ─── Roblox Username Extractor ─────────────────────────────────────────────────
 const ROBLOX_USERNAME_REGEX =
   /^(?!.*__)[a-zA-Z0-9][a-zA-Z0-9_]{1,18}[a-zA-Z0-9]$|^[a-zA-Z0-9]{3,20}$/;
 
@@ -82,7 +56,6 @@ function extractRobloxUsername(comment) {
   return null;
 }
 
-// ─── TikTok Live Connection ────────────────────────────────────────────────────
 let tiktokConnection = null;
 let connectionStatus = "disconnected";
 
@@ -91,7 +64,7 @@ function connectToTikTok() {
 
   console.log(`[TIKTOK] Connecting to @${TIKTOK_USERNAME} ...`);
   tiktokConnection = new WebcastPushConnection(TIKTOK_USERNAME, {
-    processInitialData:    false,
+    processInitialData:     false,
     enableExtendedGiftInfo: true,
   });
 
@@ -124,7 +97,6 @@ function connectToTikTok() {
     .catch((err) => {
       connectionStatus = "error";
       console.error("[TIKTOK] Connection failed:", err.message);
-      console.log("[TIKTOK] Retrying in 30 seconds...");
       setTimeout(connectToTikTok, 30_000);
     });
 
@@ -139,7 +111,6 @@ function connectToTikTok() {
   });
 }
 
-// ─── Middleware ────────────────────────────────────────────────────────────────
 function requireSecret(req, res, next) {
   if (req.headers["x-api-secret"] !== API_SECRET) {
     return res.status(401).json({ error: "Unauthorized" });
@@ -147,7 +118,6 @@ function requireSecret(req, res, next) {
   next();
 }
 
-// ─── REST API ─────────────────────────────────────────────────────────────────
 app.get("/events", requireSecret, (req, res) => {
   pruneOldEvents();
   const limit = Math.min(parseInt(req.query.limit) || 10, 50);
@@ -172,24 +142,20 @@ app.post("/test-event", requireSecret, (req, res) => {
   res.json({ ok: true, queueSize: eventQueue.length });
 });
 
-// ─── Rosa SSE endpoint (obs-music-switcher.js connects here) ──────────────────
-// SSE = Server-Sent Events. The switcher keeps this connection open and
-// receives a message the moment Rosa is gifted.
 app.get("/rosa-stream", requireSecret, (req, res) => {
   res.setHeader("Content-Type",  "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection",    "keep-alive");
   res.flushHeaders();
 
-  console.log("[OBS] obs-music-switcher connected to /rosa-stream ✅");
+  console.log("[OBS] Music switcher connected to /rosa-stream");
 
-const onRosa = (data) => {
+  const onRosa = (data) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
   events.on("rosa_gift", onRosa);
 
-  // Heartbeat every 20 seconds — stops Railway from killing the connection
   const heartbeat = setInterval(() => {
     res.write(`: heartbeat\n\n`);
   }, 20_000);
@@ -197,17 +163,12 @@ const onRosa = (data) => {
   req.on("close", () => {
     clearInterval(heartbeat);
     events.off("rosa_gift", onRosa);
-    console.log("[OBS] obs-music-switcher disconnected from /rosa-stream");
+    console.log("[OBS] Music switcher disconnected from /rosa-stream");
   });
-
-// ─── Start ────────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`\n🚀  Bridge server listening on http://localhost:${PORT}`);
-  console.log(`🔑  API Secret: ${API_SECRET}`);
-  console.log(`🎮  Poll endpoint: GET /events  (used by Roblox)`);
-  console.log(`🌸  Rosa SSE:      GET /rosa-stream  (used by obs-music-switcher.js)\n`);
-  connectToTikTok();
 });
 
-// Export event emitter so obs-music-switcher can import it when running locally
-module.exports = { events };
+app.listen(PORT, () => {
+  console.log(`\n🚀  Bridge server listening on port ${PORT}`);
+  console.log(`🌸  Rosa SSE: GET /rosa-stream\n`);
+  connectToTikTok();
+});
